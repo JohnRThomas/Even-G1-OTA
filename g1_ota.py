@@ -2,25 +2,32 @@
 """Flash Even Realities G1 firmware over BLE.
 
     g1_ota.py <application_update.zip | app_update.bin | net_core_app_update.bin>
+    g1_ota.py --adapter hci1 ...     use that Bluetooth adapter (Linux; default: the system's)
 
 Every G1 arm in range is flashed in turn (left, then right).  The update is
-stock mcumgr/SMP into the MCUboot secondary slot, the same path the Even app
-uses.  THERE IS NO REVERT: the G1 bootloader is overwrite-only, so the old
-image is gone as soon as the arm reboots.  See README.md.
+stock mcumgr/SMP into the MCUboot secondary slot.  THERE IS NO REVERT: the G1
+bootloader is overwrite-only, so the old image is gone as soon as the arm reboots.
 """
+import argparse
 import asyncio
 import hashlib
 import io
 import os
+import re
 import struct
 import sys
 import time
 import zipfile
 
-import cbor2
-from bleak import BleakClient, BleakScanner
+try:
+    import cbor2
+    from bleak import BleakClient, BleakScanner
+except ImportError as e:
+    sys.exit(f"{e}.  The OTA tools need the packages in tools/ota/requirements.txt: run "
+             f"tools/ota/setup.sh once, then use tools/ota/.venv/bin/python instead of python3.")
 
 NAME_PREFIX = "Even G1_"
+ADAPTER = None   # local Bluetooth adapter to use (BlueZ name such as "hci1"); None = default
 SMP_CHAR = "da2e7828-fbce-4e01-ae9e-261174997c48"     # mcumgr SMP, write + notify
 NUS_RX_CHAR = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # G1 command channel, write
 
@@ -46,6 +53,49 @@ class OtaError(Exception):
 
 def log(msg):
     print(msg, flush=True)
+
+
+def adapter_kw():
+    """Keyword arguments that steer bleak to ADAPTER (ignored off Linux)."""
+    return {"adapter": ADAPTER} if ADAPTER else {}
+
+
+def list_adapters():
+    """[(name, label)] of the local Bluetooth adapters (Linux: /sys/class/bluetooth).
+    The label is the adapter's address where sysfs has it, else the USB
+    device's manufacturer and product, so two dongles can be told apart."""
+    base = "/sys/class/bluetooth"
+    try:
+        names = sorted(n for n in os.listdir(base) if re.fullmatch(r"hci\d+", n))
+    except OSError:
+        return []
+
+    def read(path):
+        try:
+            with open(path) as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    out = []
+    for n in names:
+        label = read(f"{base}/{n}/address")
+        if not label:
+            # hciX/device is the USB interface; its parent is the USB device
+            usb = os.path.dirname(os.path.realpath(f"{base}/{n}/device"))
+            words = [w for w in (read(f"{usb}/manufacturer"), read(f"{usb}/product")) if w]
+            vid, pid = read(f"{usb}/idVendor"), read(f"{usb}/idProduct")
+            if words:
+                label = " ".join(dict.fromkeys(words))   # drop a repeated vendor name
+            elif vid:
+                label = f"{USB_VENDORS.get(vid, 'USB')} {vid}:{pid}"
+        out.append((n, label))
+    return out
+
+
+USB_VENDORS = {"8087": "Intel", "8086": "Intel", "0a12": "CSR", "0bda": "Realtek", "2357": "TP-Link",
+               "0cf3": "Qualcomm", "04ca": "Lite-On", "0489": "Foxconn", "13d3": "IMC", "1286": "Marvell",
+               "0b05": "ASUS", "050d": "Belkin", "0e8d": "MediaTek", "413c": "Dell", "046d": "Logitech"}
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +171,12 @@ class Link:
         deadline = time.monotonic() + wait
         while True:
             try:
-                device = await BleakScanner.find_device_by_address(self.address, timeout=10.0)
+                device = await BleakScanner.find_device_by_address(self.address, timeout=10.0,
+                                                                   **adapter_kw())
                 if device is None:
                     raise OtaError("not advertising")
-                self.client = BleakClient(device, disconnected_callback=lambda _: self.rx_event.set())
+                self.client = BleakClient(device, disconnected_callback=lambda _: self.rx_event.set(),
+                                          **adapter_kw())
                 await self.client.connect()
                 self.smp = self.client.services.get_characteristic(SMP_CHAR)
                 if self.smp is None:
@@ -301,28 +353,46 @@ async def flash_arm(address, name, images):
         log(f"  {CORE[img.index]}: installed {img.hash.hex()[:16]}")
 
 
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+def select_arms(found):
+    """The G1 arms among scan results as (name, address), left before right."""
+    arms = sorted(((d.name, d.address) for d in found if (d.name or "").startswith(NAME_PREFIX)),
+                  key=lambda a: ("_L_" not in a[0], a[0]))
+    return arms
+
+
+async def find_arms():
+    log("scanning for G1 arms" + (f" on {ADAPTER}" if ADAPTER else ""))
+    arms = select_arms(await BleakScanner.discover(timeout=10.0, **adapter_kw()))
+    if not arms:
+        raise OtaError("no Even G1 found (out of the case, lid open, Even app closed?)")
+    log("found: " + ", ".join(name for name, _ in arms))
+    return arms
+
+
 async def main(path):
     images = load_images(path)
     for img in images:
         log(f"{img.name}: {CORE[img.index]}, {len(img.data)} bytes, hash {img.hash.hex()[:16]}")
-
-    log("scanning for G1 arms")
-    found = await BleakScanner.discover(timeout=10.0)
-    arms = sorted(((d.name, d.address) for d in found if (d.name or "").startswith(NAME_PREFIX)),
-                  key=lambda a: ("_L_" not in a[0], a[0]))
-    if not arms:
-        raise OtaError("no Even G1 found (out of the case, lid open, Even app closed?)")
-    log("found: " + ", ".join(name for name, _ in arms))
-    for name, address in arms:
+    for name, address in await find_arms():
         await flash_arm(address, name, images)
     log("\ndone")
 
 
+def parse_args(argv):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("path", help="update .zip / MCUboot .bin")
+    ap.add_argument("--adapter", help="Bluetooth adapter to use, e.g. hci1 (Linux; default: the system's)")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1].startswith("-"):
-        sys.exit(__doc__)
+    args = parse_args(sys.argv[1:])
+    ADAPTER = args.adapter or None
     try:
-        asyncio.run(main(sys.argv[1]))
+        asyncio.run(main(args.path))
     except OtaError as e:
         sys.exit(f"error: {e}")
     except KeyboardInterrupt:

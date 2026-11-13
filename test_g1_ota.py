@@ -122,13 +122,18 @@ class Dev:
         self.name, self.address = arm.name, arm.address
 
 
+ADAPTERS_SEEN = []   # the adapter= each scan / client was given
+
+
 class FakeScanner:
     @staticmethod
-    async def discover(timeout=5.0):
+    async def discover(timeout=5.0, adapter=None):
+        ADAPTERS_SEEN.append(adapter)
         return [Dev(a) for a in ARMS.values() if a.advertising()] + [type("D", (), {"name": None, "address": "x"})()]
 
     @staticmethod
-    async def find_device_by_address(address, timeout=10.0):
+    async def find_device_by_address(address, timeout=10.0, adapter=None):
+        ADAPTERS_SEEN.append(adapter)
         end = time.monotonic() + min(timeout, 1.0)
         while time.monotonic() < end:
             if ARMS[address].advertising():
@@ -147,7 +152,8 @@ class Services:
 
 
 class FakeClient:
-    def __init__(self, device, disconnected_callback=None):
+    def __init__(self, device, disconnected_callback=None, adapter=None):
+        ADAPTERS_SEEN.append(adapter)
         self.arm = ARMS[device.address]
         self.on_disconnect = disconnected_callback
         self.is_connected = False
@@ -306,6 +312,17 @@ def main(tmp):
     ARMS.clear()
     err = run(zpath)
     assert err and "no Even G1 found" in err, err
+
+    print("### 8b. --adapter reaches every scan and connection")
+    assert set(ADAPTERS_SEEN) == {None}, set(ADAPTERS_SEEN)
+    ADAPTERS_SEEN.clear()
+    g1_ota.ADAPTER = "hci1"
+    ARMS["AA:L"] = Arm("Even G1_44_L_AAAAAA", "AA:L", old_app)
+    assert run(f"{tmp}/app_update.bin") is None
+    assert ADAPTERS_SEEN and set(ADAPTERS_SEEN) == {"hci1"}, set(ADAPTERS_SEEN)
+    g1_ota.ADAPTER = None
+    ADAPTERS_SEEN.clear()
+
     print("ALL OK")
 
 
